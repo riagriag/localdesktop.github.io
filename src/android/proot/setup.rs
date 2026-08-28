@@ -3,28 +3,31 @@ use crate::{
     android::{
         app::build::PolarBearBackend,
         backend::{
-            wayland::{Compositor, WaylandBackend},
+            wayland::{Compositor, TouchMode, WaylandBackend},
             webview::{ErrorVariant, WebviewBackend},
         },
         utils::application_context::get_application_context,
-        utils::ndk::run_in_jvm,
+        utils::ndk::{density_dpi, long_press_timeout_ms, scale_factor, touch_slop_px},
     },
-    core::config::{CommandConfig, ARCH_FS_ARCHIVE, ARCH_FS_ROOT, DOCS_HOME_URL, PULSE_GUEST_SERVER},
+    core::config::{
+        CommandConfig, ARCH_FS_ARCHIVE, ARCH_FS_ROOT, DOCS_HOME_URL, PIPEWIRE_GUEST_RUNTIME_DIR,
+        PULSE_GUEST_SERVER,
+    },
 };
-use jni::objects::JObject;
-use jni::sys::_jobject;
 use pathdiff::diff_paths;
 use smithay::utils::Clock;
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
+    process,
     sync::{
         mpsc::{self, Sender},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tar::Archive;
 use winit::platform::android::activity::AndroidApp;
@@ -54,6 +57,19 @@ type SetupStage = Box<dyn Fn(&SetupOptions) -> StageOutput + Send>;
 /// - Heavy/long work belongs inside the spawned thread of a returned `Some(JoinHandle)`, so it runs once at install and surfaces as setup progress.
 /// - Simple/light tasks or important settings that must be run every launch (e.g. the Firefox config) can be done inline on the `None` path.
 type StageOutput = Option<JoinHandle<()>>;
+
+const PIPEWIRE_GUEST_LOCK_PACKAGES: &[&str] = &[
+    "libpipewire",
+    "pipewire",
+    "pipewire-alsa",
+    "pipewire-audio",
+    "pipewire-jack",
+    "pipewire-pulse",
+    "pipewire-v4l2",
+    "pipewire-zeroconf",
+    "gst-plugin-pipewire",
+    "wireplumber",
+];
 
 fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
     let context = get_application_context();
@@ -212,6 +228,60 @@ fn simulate_linux_sysdata_stage(options: &SetupOptions) -> StageOutput {
     None
 }
 
+fn setup_machine_id(_: &SetupOptions) -> StageOutput {
+    let fs_root = Path::new(ARCH_FS_ROOT);
+    let machine_id = fs_root.join("etc/machine-id");
+
+    let existing = fs::read_to_string(&machine_id).unwrap_or_default();
+    if !is_valid_machine_id(&existing) {
+        if let Some(parent) = machine_id.parent() {
+            fs::create_dir_all(parent).expect("Failed to create /etc for machine-id");
+        }
+
+        let _ = fs::set_permissions(&machine_id, fs::Permissions::from_mode(0o644));
+        fs::write(&machine_id, format!("{}\n", generate_machine_id()))
+            .expect("Failed to write machine-id");
+        let _ = fs::set_permissions(&machine_id, fs::Permissions::from_mode(0o444));
+        log::info!("Seeded guest /etc/machine-id");
+    }
+
+    let dbus_dir = fs_root.join("var/lib/dbus");
+    fs::create_dir_all(&dbus_dir).expect("Failed to create /var/lib/dbus");
+    let dbus_machine_id = dbus_dir.join("machine-id");
+    match fs::symlink_metadata(&dbus_machine_id) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            symlink("/etc/machine-id", &dbus_machine_id)
+                .expect("Failed to symlink /var/lib/dbus/machine-id");
+        }
+        Err(err) => panic!("Failed to inspect /var/lib/dbus/machine-id: {}", err),
+    }
+
+    None
+}
+
+fn is_valid_machine_id(value: &str) -> bool {
+    let value = value.trim();
+    value.len() == 32
+        && value.chars().all(|c| c.is_ascii_hexdigit())
+        && value.chars().any(|c| c != '0')
+}
+
+fn generate_machine_id() -> String {
+    if let Ok(uuid) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
+        let id = uuid.trim().replace('-', "").to_ascii_lowercase();
+        if is_valid_machine_id(&id) {
+            return id;
+        }
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{:016x}{:016x}", nanos as u64, process::id() as u64)
+}
+
 fn install_dependencies(options: &SetupOptions) -> StageOutput {
     let SetupOptions {
         mpsc_sender,
@@ -239,6 +309,8 @@ fn install_dependencies(options: &SetupOptions) -> StageOutput {
     if installed() {
         return None;
     }
+
+    clear_pipewire_package_lock_for_install();
 
     let mpsc_sender = mpsc_sender.clone();
     return Some(thread::spawn(move || {
@@ -270,6 +342,7 @@ fn install_dependencies(options: &SetupOptions) -> StageOutput {
             .run();
 
             if installed() {
+                download_user_manual();
                 return;
             }
             mpsc_sender
@@ -293,6 +366,72 @@ fn install_dependencies(options: &SetupOptions) -> StageOutput {
     }));
 }
 
+/// Drop the offline User Manual for this app version onto the guest desktop.
+///
+/// The filename carries no version so an update overwrites the previous copy instead of landing
+/// beside it. Called once a fresh install or update has just succeeded — the only moment the
+/// manual on disk can be out of date — and best-effort: a failed download is not worth a retry.
+fn download_user_manual() {
+    let username = get_application_context().local_config.user.username;
+    let desktop_dir = chroot_home_dir(Path::new(ARCH_FS_ROOT), &username).join("Desktop");
+    if fs::create_dir_all(&desktop_dir).is_err() {
+        return;
+    }
+
+    let url = crate::core::config::user_manual_url();
+    let response = reqwest::blocking::get(&url).and_then(|it| it.error_for_status());
+    if let Ok(bytes) = response.and_then(|it| it.bytes()) {
+        let _ = fs::write(desktop_dir.join("Local Desktop - User Manual.pdf"), &bytes);
+    }
+}
+
+fn clear_pipewire_package_lock_for_install() {
+    let pacman_conf = Path::new(ARCH_FS_ROOT).join("etc/pacman.conf");
+    let content = match fs::read_to_string(&pacman_conf) {
+        Ok(content) => content,
+        Err(error) => {
+            log::warn!(
+                "Skipping PipeWire pacman unlock before install; failed to read {}: {error}",
+                pacman_conf.display()
+            );
+            return;
+        }
+    };
+
+    let updated = remove_pacman_ignore_pkg(&content, PIPEWIRE_GUEST_LOCK_PACKAGES);
+    if updated != content {
+        fs::write(&pacman_conf, updated)
+            .expect("Failed to clear PipeWire pacman lock before install");
+        log::info!("Temporarily cleared guest PipeWire package lock before dependency install");
+    }
+}
+
+fn setup_pipewire_package_lock(_: &SetupOptions) -> StageOutput {
+    let pacman_conf = Path::new(ARCH_FS_ROOT).join("etc/pacman.conf");
+    let content = match fs::read_to_string(&pacman_conf) {
+        Ok(content) => content,
+        Err(error) => {
+            log::warn!(
+                "Skipping PipeWire pacman lock; failed to read {}: {error}",
+                pacman_conf.display()
+            );
+            return None;
+        }
+    };
+
+    let updated = ensure_pacman_ignore_pkg(&content, PIPEWIRE_GUEST_LOCK_PACKAGES);
+    if updated != content {
+        fs::write(&pacman_conf, updated).expect("Failed to write PipeWire pacman lock");
+        log::info!(
+            "Locked guest PipeWire packages in {}: {}",
+            pacman_conf.display(),
+            PIPEWIRE_GUEST_LOCK_PACKAGES.join(" ")
+        );
+    }
+
+    None
+}
+
 fn setup_firefox_config(_: &SetupOptions) -> StageOutput {
     // Create the Firefox root directory if it doesn't exist
     let firefox_root = format!("{}/usr/lib/firefox", ARCH_FS_ROOT);
@@ -305,6 +444,7 @@ fn setup_firefox_config(_: &SetupOptions) -> StageOutput {
     // Create autoconfig.js in defaults/pref
     let autoconfig_js = r#"pref("general.config.filename", "localdesktop.cfg");
 pref("general.config.obscure_value", 0);
+pref("general.config.sandbox_enabled", false);
 "#;
 
     let _ = fs::write(format!("{}/autoconfig.js", pref_dir), autoconfig_js)
@@ -314,6 +454,14 @@ pref("general.config.obscure_value", 0);
     let firefox_cfg = r#"// Auto updated by Local Desktop on each startup, do not edit manually
 defaultPref("media.cubeb.sandbox", false);
 defaultPref("security.sandbox.content.level", 0);
+defaultPref("media.allow-audio-non-utility", true);
+defaultPref("media.rdd-process.enabled", false);
+
+try {
+  var { SandboxUtils } = ChromeUtils.importESModule("resource://gre/modules/SandboxUtils.sys.mjs");
+  SandboxUtils.maybeWarnAboutDisabledContentSandbox = () => {};
+  SandboxUtils.observeContentSandboxPref = () => {};
+} catch (_) {}
 "#; // It is required that the first line of this file is a comment, even if you have nothing to comment. Docs: https://support.mozilla.org/en-US/kb/customizing-firefox-using-autoconfig
 
     let _ = fs::write(format!("{}/localdesktop.cfg", firefox_root), firefox_cfg)
@@ -415,6 +563,130 @@ fn upsert_kv_file(path: &Path, delimiter: char, updates: &[(&str, String)]) {
     fs::write(path, content).expect("Failed to write key/value file");
 }
 
+fn ensure_pacman_ignore_pkg(content: &str, packages: &[&str]) -> String {
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let value = packages.join(" ");
+
+    let Some(options_start) = lines.iter().position(|line| line.trim() == "[options]") else {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("[options]".to_string());
+        lines.push(format!("IgnorePkg   = {value}"));
+        let mut out = lines.join("\n");
+        out.push('\n');
+        return out;
+    };
+
+    let options_end = lines
+        .iter()
+        .enumerate()
+        .skip(options_start + 1)
+        .find(|(_, line)| {
+            let trimmed = line.trim();
+            trimmed.starts_with('[') && trimmed.ends_with(']')
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+
+    let mut insert_after_comment = None;
+    for index in options_start + 1..options_end {
+        let trimmed = lines[index].trim_start();
+        let active = !trimmed.starts_with('#');
+        let candidate = if active {
+            trimmed
+        } else {
+            trimmed.trim_start_matches('#').trim_start()
+        };
+
+        let Some((key, existing)) = candidate.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "IgnorePkg" {
+            continue;
+        }
+
+        if active {
+            let merged = merge_pacman_list(existing, packages);
+            lines[index] = format!("IgnorePkg   = {merged}");
+            let mut out = lines.join("\n");
+            out.push('\n');
+            return out;
+        }
+
+        insert_after_comment = Some(index + 1);
+    }
+
+    lines.insert(
+        insert_after_comment.unwrap_or(options_start + 1),
+        format!("IgnorePkg   = {value}"),
+    );
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn merge_pacman_list(existing: &str, packages: &[&str]) -> String {
+    let mut values: Vec<String> = existing.split_whitespace().map(str::to_string).collect();
+    for package in packages {
+        if !values.iter().any(|value| value == package) {
+            values.push((*package).to_string());
+        }
+    }
+    values.join(" ")
+}
+
+fn remove_pacman_ignore_pkg(content: &str, packages: &[&str]) -> String {
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+
+    let Some(options_start) = lines.iter().position(|line| line.trim() == "[options]") else {
+        let mut out = lines.join("\n");
+        out.push('\n');
+        return out;
+    };
+
+    let options_end = lines
+        .iter()
+        .enumerate()
+        .skip(options_start + 1)
+        .find(|(_, line)| {
+            let trimmed = line.trim();
+            trimmed.starts_with('[') && trimmed.ends_with(']')
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+
+    for line in lines.iter_mut().take(options_end).skip(options_start + 1) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, existing)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "IgnorePkg" {
+            continue;
+        }
+
+        let remaining = existing
+            .split_whitespace()
+            .filter(|value| !packages.iter().any(|package| package == value))
+            .collect::<Vec<_>>()
+            .join(" ");
+        *line = if remaining.is_empty() {
+            "IgnorePkg   =".to_string()
+        } else {
+            format!("IgnorePkg   = {remaining}")
+        };
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
 fn setup_fake_bwrap(_: &SetupOptions) -> StageOutput {
     let fs_root = Path::new(ARCH_FS_ROOT);
     let wrapper_path = fs_root.join("usr/local/bin/bwrap");
@@ -458,6 +730,65 @@ exec "$@"
     fs::write(&wrapper_path, wrapper).expect("Failed to write bwrap wrapper");
     fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
         .expect("Failed to mark bwrap wrapper executable");
+
+    None
+}
+
+fn setup_chromium_no_sandbox(_: &SetupOptions) -> StageOutput {
+    let fs_root = Path::new(ARCH_FS_ROOT);
+
+    // Chromium's sandbox needs CLONE_NEWUSER, which Android SELinux blocks, so every
+    // Chromium/Electron app has to be started with --no-sandbox. Electron apps pick that up
+    // from ELECTRON_DISABLE_SANDBOX (exported by startxfce4-localdesktop), but Chromium itself
+    // only takes the flag, and its desktop entry hardcodes an absolute path that a
+    // /usr/local/bin wrapper cannot intercept. So shadow the affected application entries in
+    // the user's own XDG directory, re-running every session to catch newly installed apps.
+    write_executable(
+        &fs_root.join("usr/local/bin/localdesktop-no-sandbox-entries"),
+        r#"#!/bin/sh
+target_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$target_dir" || exit 0
+
+for src in /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop; do
+    [ -f "$src" ] || continue
+
+    prog=$(sed -n 's/^Exec=//p' "$src" | head -n1 | awk '{print $1}')
+    [ -n "$prog" ] || continue
+    case "$prog" in
+        /*) bin="$prog" ;;
+        *) bin=$(command -v "$prog" 2>/dev/null) || continue ;;
+    esac
+    bin=$(readlink -f "$bin" 2>/dev/null)
+    [ -n "$bin" ] || continue
+
+    # Every Chromium/Electron build ships the setuid sandbox helper next to its binary,
+    # or one level up when the launcher lives in a bin/ subdirectory.
+    dir=$(dirname "$bin")
+    [ -e "$dir/chrome-sandbox" ] || [ -e "$dir/../chrome-sandbox" ] || continue
+
+    dst="$target_dir/$(basename "$src")"
+    # Leave alone anything the user wrote themselves.
+    if [ -e "$dst" ] && ! grep -q '^X-LocalDesktop-NoSandbox=' "$dst"; then
+        continue
+    fi
+
+    awk '
+        /^\[Desktop Entry\]/ && !seen { print; print "X-LocalDesktop-NoSandbox=true"; seen = 1; next }
+        /^Exec=/ && !/--no-sandbox/ { sub(/^Exec=[^ ]+/, "& --no-sandbox") }
+        { print }
+    ' "$src" > "$dst"
+done
+"#,
+    );
+
+    // Same flag for terminal launches, following the /usr/local/bin PATH-priority pattern.
+    write_executable(
+        &fs_root.join("usr/local/bin/chromium"),
+        r#"#!/bin/sh
+[ -x /usr/bin/chromium ] || { echo "chromium is not installed" >&2; exit 127; }
+exec /usr/bin/chromium --no-sandbox "$@"
+"#,
+    );
 
     None
 }
@@ -518,42 +849,6 @@ fn write_executable(path: &Path, contents: &str) {
         .expect("Failed to mark executable script");
 }
 
-fn read_android_density_dpi(android_app: AndroidApp) -> i32 {
-    let mut density_dpi: i32 = 160;
-    run_in_jvm(
-        |env, app| {
-            let activity = unsafe { JObject::from_raw(app.activity_as_ptr() as *mut _jobject) };
-            let resources = env
-                .call_method(
-                    activity,
-                    "getResources",
-                    "()Landroid/content/res/Resources;",
-                    &[],
-                )
-                .expect("Failed to call getResources")
-                .l()
-                .expect("Failed to read getResources result");
-            let metrics = env
-                .call_method(
-                    resources,
-                    "getDisplayMetrics",
-                    "()Landroid/util/DisplayMetrics;",
-                    &[],
-                )
-                .expect("Failed to call getDisplayMetrics")
-                .l()
-                .expect("Failed to read getDisplayMetrics result");
-            density_dpi = env
-                .get_field(&metrics, "densityDpi", "I")
-                .expect("Failed to read densityDpi")
-                .i()
-                .expect("Failed to convert densityDpi");
-        },
-        android_app,
-    );
-    density_dpi
-}
-
 /// Map Android density to a whole-number UI scale factor (same baseline as the old LXQt setup).
 fn android_ui_scale(density_dpi: i32) -> i32 {
     ((density_dpi as f32) / 160.0 * 1.1).max(1.0).round() as i32
@@ -565,8 +860,7 @@ fn setup_xfce_wayland(options: &SetupOptions) -> StageOutput {
     let home_dir = chroot_home_dir(fs_root, &username);
     let labwc_dir = home_dir.join(".config/xfce4/labwc");
 
-    let density_dpi = read_android_density_dpi(options.android_app.clone());
-    let ui_scale = android_ui_scale(density_dpi);
+    let ui_scale = android_ui_scale(density_dpi(&options.android_app));
     // Xft uses 96 as the default logical DPI; multiply by scale for HiDPI fonts.
     let xft_dpi = ui_scale * 96;
 
@@ -619,12 +913,21 @@ fn setup_xfce_wayland(options: &SetupOptions) -> StageOutput {
     // session manager, panel, compositor (labwc), and desktop manager.
     write_executable(
         &fs_root.join("usr/local/bin/startxfce4-localdesktop"),
-        r#"#!/bin/sh
+        &format!(
+            r#"#!/bin/sh
+export PIPEWIRE_RUNTIME_DIR={PIPEWIRE_GUEST_RUNTIME_DIR}
+export PULSE_SERVER={PULSE_GUEST_SERVER}
+: "${{XDG_RUNTIME_DIR:={PIPEWIRE_GUEST_RUNTIME_DIR}}}"
+export XDG_RUNTIME_DIR
+# Electron adds --no-sandbox when this is set; Android has no user namespaces for it to use.
+export ELECTRON_DISABLE_SANDBOX=1
 exec startxfce4 --wayland "$@"
-"#,
+"#
+        ),
     );
 
-    // Runs from ~/.config/autostart once xfsettingsd is up; reinforces pre-seeded /Xft/DPI.
+    // Runs from ~/.config/autostart once xfsettingsd is up; reinforces pre-seeded /Xft/DPI and
+    // refreshes the --no-sandbox application entries for anything installed since last session.
     write_executable(
         &fs_root.join("usr/local/bin/localdesktop-xfce-session-init"),
         &format!(
@@ -636,6 +939,8 @@ done
 
 xfconf-query -c xsettings -p /Xft/DPI -n -t int -s {xft_dpi} 2>/dev/null || \
 xfconf-query -c xsettings -p /Xft/DPI -t int -s {xft_dpi}
+
+/usr/local/bin/localdesktop-no-sandbox-entries
 "#
         ),
     );
@@ -678,24 +983,6 @@ StartupNotify=true
         );
     }
 
-    // Pre-download the matching offline User Manual (light, desktop size) onto the
-    // Desktop. Best-effort and off-thread so it never blocks setup; create-if-missing
-    // via the version in the filename. The on-disk name is human-friendly.
-    let version = crate::core::config::VERSION;
-    let manual_path = desktop_dir.join(format!("Local Desktop v{version} - User Manual.pdf"));
-    if !manual_path.exists() {
-        let url = crate::core::config::user_manual_url();
-        thread::spawn(move || {
-            if let Ok(response) = reqwest::blocking::get(&url) {
-                if let Ok(response) = response.error_for_status() {
-                    if let Ok(bytes) = response.bytes() {
-                        let _ = fs::write(&manual_path, &bytes);
-                    }
-                }
-            }
-        });
-    }
-
     let autostart_dir = home_dir.join(".config/autostart");
     let _ = fs::create_dir_all(&autostart_dir);
 
@@ -705,7 +992,7 @@ StartupNotify=true
 Version=1.0
 Type=Application
 Name=Local Desktop Xfce Session Init
-Comment=Apply HiDPI font scaling via xfsettings
+Comment=Apply HiDPI font scaling and refresh sandbox-free application entries
 Exec=/usr/local/bin/localdesktop-xfce-session-init
 Terminal=false
 OnlyShowIn=XFCE;
@@ -835,21 +1122,6 @@ done
 
     None
 }
-/// Writing a PulseAudio conf, so all application know where to direkt the stream
-/// This way it is agnostic to the Desktop Environment
-fn setup_pulse_client_conf(_: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
-    let pulse_config_dir = fs_root.join("root/.config/pulse");
-    let _ = fs::create_dir_all(&pulse_config_dir);
-    let body = format!(
-        "# Local Desktop — host PulseAudio (written by setup, do not edit)\n\
-         default-server = {PULSE_GUEST_SERVER}\n\
-         autospawn = no\n"
-    );
-    fs::write(pulse_config_dir.join("client.conf"), body)
-        .expect("Failed to write pulse client.conf");
-    None
-}
 fn fix_xkb_symlink(options: &SetupOptions) -> StageOutput {
     let fs_root = Path::new(ARCH_FS_ROOT);
     let xkb_path = fs_root.join("usr/share/X11/xkb");
@@ -913,7 +1185,7 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
     }
 
     let options = SetupOptions {
-        android_app,
+        android_app: android_app.clone(),
         mpsc_sender: sender.clone(),
     };
 
@@ -921,12 +1193,14 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
         Box::new(setup_arch_fs),                // Step 1. Setup Arch FS (extract)
         Box::new(simulate_linux_sysdata_stage), // Step 2. Simulate Linux system data
         Box::new(install_dependencies),         // Step 3. Install dependencies
-        Box::new(setup_firefox_config),         // Step 4. Setup Firefox config
-        Box::new(setup_fake_bwrap), // Step 5. Replace bwrap with a no-sandbox shim (Android has no user namespaces)
-        Box::new(setup_onboard_signal_fix), // Step 6. Wrap Onboard to survive proot fstat/signal.set_wakeup_fd failure
-        Box::new(setup_xfce_wayland),       // Step 7. Setup Xfce Wayland launch and HiDPI scaling
-        Box::new(fix_xkb_symlink),          // Step 8. Fix xkb symlink
-        Box::new(setup_pulse_client_conf), // Step 9. Write PulseAudio conf (last)
+        Box::new(setup_machine_id),             // Step 4. Seed /etc/machine-id for D-Bus clients
+        Box::new(setup_pipewire_package_lock), // Step 5. Hold guest PipeWire packages for the Android-side PipeWire POC
+        Box::new(setup_firefox_config),        // Step 6. Setup Firefox config
+        Box::new(setup_fake_bwrap), // Step 7. Replace bwrap with a no-sandbox shim (Android has no user namespaces)
+        Box::new(setup_chromium_no_sandbox), // Step 8. Make Chromium/Electron apps launchable without a terminal
+        Box::new(setup_onboard_signal_fix), // Step 9. Wrap Onboard to survive proot fstat/signal.set_wakeup_fd failure
+        Box::new(setup_xfce_wayland),       // Step 10. Setup Xfce Wayland launch and HiDPI scaling
+        Box::new(fix_xkb_symlink),          // Step 11. Fix xkb symlink
     ];
 
     let handle_stage_error = |e: Box<dyn std::any::Any + Send>, sender: &Sender<SetupMessage>| {
@@ -1001,12 +1275,16 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
             graphic_renderer: None,
             clock: Clock::new(),
             key_counter: 0,
-            scale_factor: 1.0,
+            guest_scale_factor: scale_factor(&android_app),
             touch_points: std::collections::HashMap::new(),
             scroll_centroid: None,
-            touch_gesture_was_multi_touch: false,
+            touch_mode: TouchMode::Undecided,
             touch_down_position: None,
+            touch_down_time: None,
+            touch_slop_px: touch_slop_px(&android_app),
+            long_press_timeout_ms: long_press_timeout_ms(&android_app),
             pointer_pressed: false,
+            android_app,
         })
     } else {
         PolarBearBackend::WebView(WebviewBackend::build(receiver, progress))
